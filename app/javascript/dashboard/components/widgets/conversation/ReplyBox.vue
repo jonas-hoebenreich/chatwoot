@@ -137,6 +137,7 @@ import messageFormatterMixin from 'shared/mixins/messageFormatterMixin';
 import { checkFileSizeLimit } from 'shared/helpers/FileHelper';
 import { MAXIMUM_FILE_UPLOAD_SIZE } from 'shared/constants/messages';
 import { BUS_EVENTS } from 'shared/constants/busEvents';
+import { debounce } from 'shared/helpers/TimeHelpers';
 
 import {
   isEscape,
@@ -149,6 +150,8 @@ import inboxMixin from 'shared/mixins/inboxMixin';
 import uiSettingsMixin from 'dashboard/mixins/uiSettings';
 import { DirectUpload } from 'activestorage';
 import { frontendURL } from '../../../helper/URLHelper';
+import { LocalStorage, LOCAL_STORAGE_KEYS } from '../../../helper/localStorage';
+import { trimMessage } from '../../../store/modules/conversations/helpers';
 
 export default {
   components: {
@@ -201,6 +204,7 @@ export default {
       hasSlashCommand: false,
       bccEmails: '',
       ccEmails: '',
+      doAutoSaveDraft: () => {},
     };
   },
   computed: {
@@ -406,10 +410,19 @@ export default {
     profilePath() {
       return frontendURL(`accounts/${this.accountId}/profile/settings`);
     },
+    conversationId() {
+      return this.currentChat.id;
+    },
   },
   watch: {
-    currentChat(conversation) {
+    currentChat(conversation, oldConversation) {
       const { can_reply: canReply } = conversation;
+
+      if (oldConversation.id !== conversation.id) {
+        this.setToDraft(oldConversation.id, this.replyType);
+        this.getFromDraft();
+      }
+
       if (this.isOnPrivateNote) {
         return;
       }
@@ -434,30 +447,99 @@ export default {
         this.mentionSearchKey = '';
         this.showMentions = false;
       }
+      this.doAutoSaveDraft();
+    },
+    replyType(updatedReplyType, oldReplyType) {
+      this.setToDraft(this.conversationId, oldReplyType);
+      this.getFromDraft();
     },
   },
 
   mounted() {
+    this.getFromDraft();
     // Donot use the keyboard listener mixin here as the events here are supposed to be
     // working even if input/textarea is focussed.
     document.addEventListener('keydown', this.handleKeyEvents);
     document.addEventListener('paste', this.onPaste);
 
     this.setCCEmailFromLastChat();
+    this.doAutoSaveDraft = debounce(
+      () => {
+        this.saveDraft(this.conversationId, this.replyType);
+      },
+      5000,
+      false
+    );
   },
   destroyed() {
     document.removeEventListener('keydown', this.handleKeyEvents);
     document.removeEventListener('paste', this.onPaste);
   },
   methods: {
+    getSavedDraftMessages() {
+      return LocalStorage.get(LOCAL_STORAGE_KEYS.DRAFT_MESSAGES) || {};
+    },
+    saveDraft(conversationId, replyType) {
+      if (this.message || this.message === '') {
+        const savedDraftMessages = this.getSavedDraftMessages();
+        const key = `draft-${conversationId}-${replyType}`;
+        const draftToSave = trimMessage(this.message || '');
+        const {
+          [key]: currentDraft,
+          ...restOfDraftMessages
+        } = savedDraftMessages;
+
+        const updatedDraftMessages = draftToSave
+          ? {
+              ...restOfDraftMessages,
+              [key]: draftToSave,
+            }
+          : restOfDraftMessages;
+
+        LocalStorage.set(
+          LOCAL_STORAGE_KEYS.DRAFT_MESSAGES,
+          updatedDraftMessages
+        );
+      }
+    },
+    setToDraft(conversationId, replyType) {
+      this.saveDraft(conversationId, replyType);
+      this.message = '';
+    },
+    getFromDraft() {
+      if (this.conversationId) {
+        try {
+          const key = `draft-${this.conversationId}-${this.replyType}`;
+          const savedDraftMessages = this.getSavedDraftMessages();
+          this.message = `${savedDraftMessages[key] || ''}`;
+        } catch (error) {
+          this.message = '';
+        }
+      }
+    },
+    removeFromDraft() {
+      if (this.conversationId) {
+        const key = `draft-${this.conversationId}-${this.replyType}`;
+        const draftMessages = this.getSavedDraftMessages();
+        const { [key]: toBeRemoved, ...updatedDraftMessages } = draftMessages;
+        LocalStorage.set(
+          LOCAL_STORAGE_KEYS.DRAFT_MESSAGES,
+          updatedDraftMessages
+        );
+      }
+    },
     onPaste(e) {
       const data = e.clipboardData.files;
+      if (!this.showRichContentEditor && data.length !== 0) {
+        this.$refs.messageInput.$el.blur();
+      }
       if (!data.length || !data[0]) {
         return;
       }
-      const file = data[0];
-      const { name, type, size } = file;
-      this.onFileUpload({ name, type, size, file });
+      data.forEach(file => {
+        const { name, type, size } = file;
+        this.onFileUpload({ name, type, size, file: file });
+      });
     },
     toggleUserMention(currentMentionState) {
       this.hasUserMention = currentMentionState;
@@ -533,6 +615,7 @@ export default {
             messagePayload
           );
           bus.$emit(BUS_EVENTS.SCROLL_TO_MESSAGE);
+          this.removeFromDraft();
         } catch (error) {
           const errorMessage =
             error?.response?.data?.error ||
@@ -604,6 +687,7 @@ export default {
     },
     onBlur() {
       this.isFocused = false;
+      this.saveDraft(this.conversationId, this.replyType);
     },
     onFocus() {
       this.isFocused = true;
@@ -645,10 +729,17 @@ export default {
       if (checkFileSizeLimit(file, MAXIMUM_FILE_UPLOAD_SIZE)) {
         const upload = new DirectUpload(
           file.file,
-          '/rails/active_storage/direct_uploads',
-          null,
-          file.file.name
+          `/api/v1/accounts/${this.accountId}/conversations/${this.currentChat.id}/direct_uploads`,
+          {
+            directUploadWillCreateBlobWithXHR: xhr => {
+              xhr.setRequestHeader(
+                'api_access_token',
+                this.currentUser.access_token
+              );
+            },
+          }
         );
+
         upload.create((error, blob) => {
           if (error) {
             this.showAlert(error);

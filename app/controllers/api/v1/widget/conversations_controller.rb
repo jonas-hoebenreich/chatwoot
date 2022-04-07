@@ -44,6 +44,18 @@ class Api::V1::Widget::ConversationsController < Api::V1::Widget::BaseController
     head :ok
   end
 
+  def toggle_status
+    return head :not_found if conversation.nil?
+
+    return head :forbidden unless @web_widget.end_conversation?
+
+    unless conversation.resolved?
+      conversation.status = :resolved
+      conversation.save
+    end
+    head :ok
+  end
+
   private
 
   def trigger_typing_event(event)
